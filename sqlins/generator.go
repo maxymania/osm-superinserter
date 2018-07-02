@@ -62,7 +62,7 @@ type Table struct{
 	HasWayArea,HasZOrder bool
 	Style style.Style /* Filtered */
 }
-func (t *Table) Init(osmtyps []string,tabname string, stl style.Style) *Table {
+func (t *Table) Init(geotp string, srid int, osmtyps []string,tabname string, stl style.Style) *Table {
 	t.Tname = tabname
 	var create,insert,values,update bytes.Buffer
 	
@@ -109,7 +109,7 @@ func (t *Table) Init(osmtyps []string,tabname string, stl style.Style) *Table {
 	if t.HasWayArea { fmt.Fprintf(&create,",\nway_area real") }
 	if t.HasZOrder { fmt.Fprintf(&create,",\nz_order integer") }
 	
-	fmt.Fprintf(&create,/*(*/ ",\ntags hstore, way geometry)")
+	fmt.Fprintf(&create,/*(*/ ",\ntags hstore, way geometry(%s,%d))",geotp,srid)
 	values.WriteTo(&insert)
 	fmt.Fprintf(&insert,/*(*/ ")")
 	
@@ -286,11 +286,12 @@ func (b *Builder) InitTables(stl style.Style, prefix string) {
 		}
 		if tf!=0 { b.Flags[l.Tag]=tf }
 	}
+	srid := b.Proj.SRID()
 	
-	b.Tables[T_Point].Init([]string{"node"},prefix+"_point",stl)
-	b.Tables[T_Line].Init([]string{"way"},prefix+"_line",stl)
-	b.Tables[T_Poly].Init([]string{"way","relation"},prefix+"_polygon",stl)
-	b.Tables[T_Roads].Init([]string{"way"},prefix+"_roads",stl)
+	b.Tables[T_Point].Init("point",srid,[]string{"node"},prefix+"_point",stl)
+	b.Tables[T_Line ].Init("linestring",srid,[]string{"way"},prefix+"_line",stl)
+	b.Tables[T_Poly ].Init("geometry",srid,[]string{"way","relation"},prefix+"_polygon",stl)
+	b.Tables[T_Roads].Init("linestring",srid,[]string{"way"},prefix+"_roads",stl)
 	for i := range b.Tables { b.Tables[i].b = b }
 }
 func (b *Builder) TouchTables() {
