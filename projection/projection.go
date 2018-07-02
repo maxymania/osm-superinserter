@@ -87,7 +87,7 @@ type Projection uint
 const (
 	LatLon Projection = iota
 	PseudoMercator
-	WGS84Mercator // Does not work!
+	WGS84Mercator
 	maxProjection
 	
 	WebMercator = PseudoMercator
