@@ -53,6 +53,7 @@ import (
 	
 	"github.com/maxymania/osm-superinserter/taglists"
 	"github.com/maxymania/osm-superinserter/osmcalc"
+	"github.com/maxymania/osm-superinserter/geombuild"
 )
 
 type Table struct{
@@ -445,6 +446,7 @@ func (b *Builder) loadTagNames(id osm.FeatureID) (tns []string,e error) {
 }
 
 func (b *Builder) NodeAdd(n *osm.Node) error {
+	if !n.Visible { return nil }
 	var err error
 	hs := tags2hstore(n.Tags)
 	
@@ -541,6 +543,7 @@ func (b *Builder) preprocessTags(n osm.Object, hs hstore.Hstore, polygon, roads 
 }
 
 func (b *Builder) WayAdd(n *osm.Way) error {
+	if !n.Visible { return nil }
 	hs := tags2hstore(n.Tags)
 	
 	var polygon,roads bool
@@ -732,8 +735,12 @@ func (b *Builder) collectLineStrings(n *osm.Relation) ([]*geom.LineString,error)
 	}
 	return l,nil
 }
-func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
+
+/*
+func (b *Builder) collectPolygonsOld(n *osm.Relation) ([]*geom.Polygon,error) {
 	l := make([]*geom.Polygon,0,len(n.Members))
+	// https://wiki.openstreetmap.org/wiki/Relation:multipolygon
+	
 	for _,member := range n.Members {
 		if member.Type!=osm.TypeWay { continue }
 		t,err := b.loadWay(member.FeatureID())
@@ -743,8 +750,47 @@ func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
 	}
 	return l,nil
 }
+*/
+
+func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
+	secondary := make([]*geom.Polygon,0,len(n.Members))
+	RP := geombuilder.NewRelPolygons()
+	
+	for _,member := range n.Members {
+		//if member.Type!=osm.TypeRelation { continue }
+		switch member.Type {
+		case osm.TypeWay,osm.TypeRelation:
+		default: continue
+		}
+		t,err := b.loadWay(member.FeatureID())
+		if err!=nil { continue }
+		
+		restart:
+		switch v := t.(type) {
+		case *geom.MultiPolygon:
+			n := v.NumPolygons()
+			if n==1 {
+				t = v.Polygon(0)
+				goto restart
+			}
+			for i := 0; i<n; i++ { secondary = append(secondary,v.Polygon(i)) }
+		case *geom.Polygon:
+			if v.NumLinearRings()==1 {
+				RP.Push(t,member.Role)
+			} else {
+				secondary = append(secondary,v)
+			}
+		default:
+			RP.Push(t,member.Role)
+		}
+	}
+	secondary = append(secondary,RP.AssemblePolygons()...)
+	return secondary,nil
+}
+
 
 func (b *Builder) RelationAdd(n *osm.Relation) error {
+	if !n.Visible { return nil }
 	hs := tags2hstore(n.Tags)
 	
 	var roads bool
