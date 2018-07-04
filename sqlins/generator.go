@@ -365,6 +365,7 @@ func (b *Builder) TouchTables() {
 	for i := range b.Tables {
 		b.DB.Exec(b.Tables[i].Csql)
 		b.DB.Exec(fmt.Sprintf("CREATE INDEX %s_ididx ON %s(osm_id)",b.Tables[i].Tname,b.Tables[i].Tname))
+		b.DB.Exec(fmt.Sprintf("CREATE INDEX %s_waygist ON %s USING GIST (way)",b.Tables[i].Tname,b.Tables[i].Tname))
 	}
 }
 func (b *Builder) begin() (err error) {
@@ -430,6 +431,24 @@ func (b *Builder) Flush() (err error) {
 
 func tags2hstore(tags osm.Tags) (r hstore.Hstore) {
 	r.Map = make(map[string]sql.NullString)
+	for _,tag := range tags {
+		r.Map[tag.Key]=sql.NullString{tag.Value,true}
+	}
+	return
+}
+
+func hstore_bakup(tagsp *osm.Tags, r hstore.Hstore){
+	*tagsp = nil
+	if r.Map==nil { return }
+	for k,v := range r.Map {
+		if !v.Valid { continue }
+		*tagsp = append(*tagsp,osm.Tag{Key:k,Value:v.String})
+	}
+}
+func hstore_restore(tags osm.Tags, r *hstore.Hstore) {
+	if r.Map==nil {
+		r.Map = make(map[string]sql.NullString)
+	}
 	for _,tag := range tags {
 		r.Map[tag.Key]=sql.NullString{tag.Value,true}
 	}
@@ -643,6 +662,7 @@ func (b *Builder) preprocessTags(n osm.Object, hs hstore.Hstore, polygon, roads 
 func (b *Builder) WayAdd(n *osm.Way) error {
 	if !n.Visible { return b.AfterWrite() }
 	hs := tags2hstore(n.Tags)
+	var hsb osm.Tags
 	
 	var polygon,roads bool
 	z_order := b.preprocessTags(n,hs,&polygon,&roads,false)
@@ -658,6 +678,8 @@ func (b *Builder) WayAdd(n *osm.Way) error {
 	}
 	
 	var err error
+	
+	hstore_bakup(&hsb,hs)
 	
 	if polygon && osmcalc.Way_IsClosed(n) {
 		LR := geom.NewLinearRingFlat(geom.XY,flt)
@@ -675,6 +697,7 @@ func (b *Builder) WayAdd(n *osm.Way) error {
 		
 		// Insert(osm_id int64,way_area float64,z_order int,hs hstore.Hstore,srid int,way geom.T)
 		err = b.Tables[T_Line].Insert(int64(n.ID),0,z_order,hs,b.Proj.SRID(),linestr)
+		hstore_restore(hsb,&hs)
 		if err!=nil { return err }
 		if roads {
 			err = b.Tables[T_Roads].Insert(int64(n.ID),0,z_order,hs,b.Proj.SRID(),linestr)
@@ -889,7 +912,7 @@ func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
 	secondary = append(secondary,RP.AssemblePolygons()...)
 	third := secondary[:0]
 	for _,poly := range secondary {
-		err := geombuilder.ValidatePolygon(poly)
+		err := geombuilder.ValidateOrRepairPolygon(poly,geom.XY)
 		if err==nil {
 			third = append(third,poly)
 		}
@@ -901,6 +924,7 @@ func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
 
 func (b *Builder) RelationAdd(n *osm.Relation) error {
 	if !n.Visible { return b.AfterWrite() }
+	var hsb osm.Tags
 	hs := tags2hstore(n.Tags)
 	
 	var roads bool
@@ -914,6 +938,8 @@ func (b *Builder) RelationAdd(n *osm.Relation) error {
 		return nil
 	}
 	
+	hstore_bakup(&hsb,hs)
+	
 	if !make_polygon {
 		objs,err := b.collectLineStrings(n)
 		if err!=nil { return err }
@@ -925,6 +951,7 @@ func (b *Builder) RelationAdd(n *osm.Relation) error {
 			obj.SetSRID(b.Proj.SRID())
 			err = b.Tables[T_Line].Insert2(-int64(n.ID),0,z_order,hs,b.Proj.SRID(),obj,true)
 			if err!=nil { return err }
+			hstore_restore(hsb,&hs)
 		}
 		if roads {
 			err = b.Tables[T_Roads].ClearDataForObject(-int64(n.ID))
@@ -933,6 +960,7 @@ func (b *Builder) RelationAdd(n *osm.Relation) error {
 				obj.SetSRID(b.Proj.SRID())
 				err = b.Tables[T_Roads].Insert2(-int64(n.ID),0,z_order,hs,b.Proj.SRID(),obj,true)
 				if err!=nil { return err }
+				hstore_restore(hsb,&hs)
 			}
 		}
 	}
