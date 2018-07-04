@@ -338,7 +338,6 @@ func (b *Builder) InitInstance(){
 	
 	b.ChunkTmo = 20*time.Second
 	b.ChunkSize = 1<<14
-	b.ChunkSize = 1
 }
 
 func (b *Builder) InitTables(stl style.Style, prefix string) {
@@ -415,13 +414,15 @@ func (b *Builder) AfterWrite() (err error) {
 func (b *Builder) Flush() (err error) {
 	for _,stm := range b.psm { stm.Close() }
 	b.psm = make(map[string]*sql.Stmt)
-	err = b.Tx.Commit()
-	if err!=nil {
-		b.Tx.Rollback()
-	} else if b.OnCommit!=nil {
-		b.OnCommit.Commit()
+	if b.Tx!=nil {
+		err = b.Tx.Commit()
+		if err!=nil {
+			b.Tx.Rollback()
+		} else if b.OnCommit!=nil {
+			b.OnCommit.Commit()
+		}
+		b.Tx = nil
 	}
-	b.Tx = nil
 	b.writes = 0
 	b.chunkStart = time.Now()
 	return
