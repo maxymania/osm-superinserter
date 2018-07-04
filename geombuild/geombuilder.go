@@ -161,10 +161,14 @@ func (r *ringStack) AssemblePolygons() (polys []*geom.Polygon) {
 	}
 	return
 }
+func (r *ringStack) Reset() {
+	*r = (*r)[:0]
+}
 
 type RelPolygons interface{
 	Push(gt geom.T,role string)
 	AssemblePolygons() (polys []*geom.Polygon)
+	Reset()
 }
 func NewRelPolygons() RelPolygons { return new(ringStack) }
 

@@ -47,12 +47,17 @@ import "log"
 import "github.com/maxymania/osm-superinserter/style"
 import "time"
 
+import "github.com/coocood/freecache"
+import "github.com/maxymania/osm-superinserter/hucache"
+import "github.com/couchbase/go-slab"
+
 var help bool
 
 var table_prefix string
 var file,checkfile,stylefile string
 var dburl string
 var cache int
+var arc,arcghost int
 
 var is_pbf bool
 var is_latlon, is_pseudomerc, is_truemerc bool
@@ -71,6 +76,8 @@ func init() {
 	flag.StringVar(&intervall,"intervall","1s","Logging intervall")
 	
 	flag.IntVar(&cache,"cache",128,"number of megabytes of cache")
+	flag.IntVar(&arc,"arc",512,"number of Arc-Slots * 2 for big objects.")
+	flag.IntVar(&arcghost,"arc-ghost",1024,"number of ghost Arc Slots * 2 for big objects.")
 	flag.BoolVar(&is_pbf,"pbf",false,".pbf data files")
 	flag.BoolVar(&is_latlon,"l",false,"Projection = Latitude / longitude; SRID = 4326")
 	flag.BoolVar(&is_pseudomerc,"m",false,"Projection = Pseudo-Mercator; SRID = 900913 (default)")
@@ -146,12 +153,37 @@ func main() {
 	
 	bdr.Proj = impproj
 	
-	if cache<16 {
+	if arc>0 || arcghost>0 {
+		cch := cache
+		if cch < 16 { cch = 1<<7 }
+		split := cch<<10 /* split := 1/1024 of the cache size. */
+		slabsz := 1<<20
+		noslab := false
+		if slabsz<split {
+			if split>=(1<<19) {
+				noslab = true
+			} else if split>=(1<<20){
+				slabsz = 1<<30
+			} else {
+				slabsz = split<<10
+			}
+		}
+		
+		if noslab {
+			bdr.Cache = freecache.NewCache(cch<<20)
+		} else {
+			nc := freecache.NewCache(cch<<20)
+			sna := slab.NewArena(split,1<<20,2,nil)
+			hc := hucache.NewARC(sna,arc,arcghost)
+			bdr.Cache = hucache.Split(nc,hc,split)
+		}
+	} else if cache<16 {
 		bdr.InitCache()
 	} else {
 		bdr.InitCache(cache<<20)
 	}
 	
+	bdr.InitInstance()
 	bdr.InitTables(cartostyle,table_prefix)
 	bdr.TouchTables()
 	

@@ -37,7 +37,7 @@ import (
 	"github.com/paulmach/osm"
 	
 	"github.com/maxymania/osm-superinserter/projection"
-	//"time"
+	"time"
 	"fmt"
 	"github.com/coocood/freecache"
 	"github.com/maxymania/osm-superinserter/style"
@@ -56,8 +56,11 @@ import (
 	"github.com/maxymania/osm-superinserter/geombuild"
 )
 
+var ERowNotFound = fmt.Errorf("Row Not Found")
+
 type Table struct{
 	b *Builder
+	Index uint
 	Tname string
 	Csql,Isql,Usql string
 	HasWayArea,HasZOrder bool
@@ -167,7 +170,9 @@ func (t *Table) Insert2(osm_id int64,way_area float64,z_order int,hs hstore.Hsto
 	}else{
 		stm,err := t.b.Get(t.Usql)
 		if err!=nil { return err }
-		if rescount(stm.Exec(target...))<1 {
+		if t.b.rescount(stm.Exec(target...))<1 {
+			err = t.b.popErr()
+			if err!=nil { return err }
 			stm,err = t.b.Get(t.Isql)
 			if err!=nil { return err }
 			_,err = stm.Exec(target...)
@@ -189,8 +194,27 @@ func (t *Table) ClearDataForObject(id int64) error {
 func (t *Table) Read(fields string,id int64, data ...interface{}) error {
 	stm,err := t.b.Get(fmt.Sprintf("SELECT %s from %s WHERE osm_id=$1",fields,t.Tname))
 	if err!=nil { return err }
-	return stm.QueryRow(id).Scan(data...)
+	rows, err := stm.Query(id)
+	if err!=nil { return err }
+	defer rows.Close()
+	if !rows.Next() {
+		if err = rows.Err(); err!=nil { return err }
+		return ERowNotFound
+	}
+	return rows.Scan(data...)
 }
+func (t *Table) ReadCommitted(fields string,id int64, data ...interface{}) error {
+	sqls := fmt.Sprintf("SELECT %s from %s WHERE osm_id=$1",fields,t.Tname)
+	rows, err := t.b.DB.Query(sqls,id)
+	if err!=nil { return err }
+	defer rows.Close()
+	if !rows.Next() {
+		if err = rows.Err(); err!=nil { return err }
+		return ERowNotFound
+	}
+	return rows.Scan(data...)
+}
+
 func (t *Table) GetTags(id int64, hs *hstore.Hstore) error {
 	var buffer bytes.Buffer
 	data := make([]interface{},1,1+len(t.Style))
@@ -246,6 +270,21 @@ const (
 	T_NUM
 )
 
+type tlin struct {
+	osm_id int64
+	way_area float64
+	z_order int
+	hs hstore.Hstore
+	srid int
+	way geom.T
+	is_insert bool
+}
+type tableLog struct {
+	Table  uint
+	Clear  bool
+	Insert tlin
+}
+
 type TagFlags uint
 const (
 	TF_Linear TagFlags = 1<<iota
@@ -258,7 +297,7 @@ type FuncCommit interface{ Commit() }
 type Builder struct{
 	DB     *sql.DB
 	Tx     *sql.Tx
-	Cache  *freecache.Cache
+	Cache  Cache /* see cache.go */
 	Proj   projection.Projection
 	Tables [T_NUM]Table
 	//Temptb [TT_NUM]TempTab
@@ -268,6 +307,24 @@ type Builder struct{
 	writes int
 	buf    [8]byte
 	buf2   [128]byte
+	
+	relPolygons  geombuilder.RelPolygons
+	ChunkTmo     time.Duration
+	chunkStart   time.Time
+	ChunkSize    int
+	
+	err          error
+}
+
+func (b *Builder) popErr() (err error) {
+	err,b.err = b.err,nil
+	return
+}
+func (b *Builder) rescount(res sql.Result,err error) int64 {
+	if err!=nil { b.err = err; return 0 }
+	i,err := res.RowsAffected()
+	if err!=nil { return 0 }
+	return i
 }
 
 func (b *Builder) InitCache(size ...int) {
@@ -275,7 +332,17 @@ func (b *Builder) InitCache(size ...int) {
 	if len(size)>0 { i = size[0] }
 	b.Cache = freecache.NewCache(i)
 }
+func (b *Builder) InitInstance(){
+	// INIT builders
+	b.relPolygons = geombuilder.NewRelPolygons()
+	
+	b.ChunkTmo = 20*time.Second
+	b.ChunkSize = 1<<14
+	b.ChunkSize = 1
+}
+
 func (b *Builder) InitTables(stl style.Style, prefix string) {
+	
 	b.Flags = make(map[string]TagFlags)
 	for _,l := range stl {
 		tf := TagFlags(0)
@@ -293,7 +360,7 @@ func (b *Builder) InitTables(stl style.Style, prefix string) {
 	b.Tables[T_Line ].Init("linestring",srid,[]string{"way"},prefix+"_line",stl)
 	b.Tables[T_Poly ].Init("geometry",srid,[]string{"way","relation"},prefix+"_polygon",stl)
 	b.Tables[T_Roads].Init("linestring",srid,[]string{"way"},prefix+"_roads",stl)
-	for i := range b.Tables { b.Tables[i].b = b }
+	for i := range b.Tables { b.Tables[i].b = b; b.Tables[i].Index = uint(i) }
 }
 func (b *Builder) TouchTables() {
 	for i := range b.Tables {
@@ -323,7 +390,14 @@ func (b *Builder) Get(sql string) (*sql.Stmt,error) {
 }
 func (b *Builder) OnWrite() { b.writes++ }
 func (b *Builder) AfterWrite() (err error) {
-	if b.writes>=(1<<14) {
+	commit := false
+	if b.writes>=b.ChunkSize { commit = true }
+	
+	if b.chunkStart.IsZero() {
+		b.chunkStart = time.Now()
+	} else if time.Since(b.chunkStart)>b.ChunkTmo { commit = true }
+	
+	if commit {
 		for _,stm := range b.psm { stm.Close() }
 		b.psm = make(map[string]*sql.Stmt)
 		err = b.Tx.Commit()
@@ -334,6 +408,7 @@ func (b *Builder) AfterWrite() (err error) {
 		}
 		b.Tx = nil
 		b.writes = 0
+		b.chunkStart = time.Now()
 	}
 	return
 }
@@ -348,6 +423,7 @@ func (b *Builder) Flush() (err error) {
 	}
 	b.Tx = nil
 	b.writes = 0
+	b.chunkStart = time.Now()
 	return
 }
 
@@ -379,6 +455,27 @@ func (b *Builder) loadWay(id osm.FeatureID) (geom.T,error) {
 		if len(vs)==0 { return nil,fmt.Errorf("not found") }
 		for _,v := range vs {
 			err = b.Tables[v].Read("ST_AsBinary(way)",sign*id.Ref(),&data)
+			if err==nil { break }
+		}
+		if err!=nil { return nil,err }
+		b.Cache.SetInt(int64(id.ElementID(cacheWay)),data,34560000)
+	}
+	return wkb.Unmarshal(data)
+}
+func (b *Builder) loadWaySlow(id osm.FeatureID) (geom.T,error) {
+	var vsr [2]uint
+	data,err := b.Cache.GetInt(int64(id.ElementID(cacheWay)))
+	if err!=nil {
+		var vs []uint
+		sign := int64(1)
+		switch id.Type() {
+		case osm.TypeNode: vs = append(vsr[:0],T_Point)
+		case osm.TypeWay: vs = append(vsr[:0],T_Line,T_Poly)
+		case osm.TypeRelation: vs = append(vsr[:0],T_Line,T_Poly); sign = -1
+		}
+		if len(vs)==0 { return nil,fmt.Errorf("not found") }
+		for _,v := range vs {
+			err = b.Tables[v].ReadCommitted("ST_AsBinary(way)",sign*id.Ref(),&data)
 			if err==nil { break }
 		}
 		if err!=nil { return nil,err }
@@ -446,7 +543,7 @@ func (b *Builder) loadTagNames(id osm.FeatureID) (tns []string,e error) {
 }
 
 func (b *Builder) NodeAdd(n *osm.Node) error {
-	if !n.Visible { return nil }
+	if !n.Visible { return b.AfterWrite() }
 	var err error
 	hs := tags2hstore(n.Tags)
 	
@@ -543,7 +640,7 @@ func (b *Builder) preprocessTags(n osm.Object, hs hstore.Hstore, polygon, roads 
 }
 
 func (b *Builder) WayAdd(n *osm.Way) error {
-	if !n.Visible { return nil }
+	if !n.Visible { return b.AfterWrite() }
 	hs := tags2hstore(n.Tags)
 	
 	var polygon,roads bool
@@ -754,7 +851,8 @@ func (b *Builder) collectPolygonsOld(n *osm.Relation) ([]*geom.Polygon,error) {
 
 func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
 	secondary := make([]*geom.Polygon,0,len(n.Members))
-	RP := geombuilder.NewRelPolygons()
+	RP := b.relPolygons
+	defer RP.Reset()
 	
 	for _,member := range n.Members {
 		//if member.Type!=osm.TypeRelation { continue }
@@ -763,7 +861,10 @@ func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
 		default: continue
 		}
 		t,err := b.loadWay(member.FeatureID())
-		if err!=nil { continue }
+		if err!=nil {
+			//log.Printf("Notice: %v in type(%v) load-way(%v)\n",err,member.Type,member.FeatureID())
+			continue
+		}
 		
 		restart:
 		switch v := t.(type) {
@@ -785,12 +886,20 @@ func (b *Builder) collectPolygons(n *osm.Relation) ([]*geom.Polygon,error) {
 		}
 	}
 	secondary = append(secondary,RP.AssemblePolygons()...)
-	return secondary,nil
+	third := secondary[:0]
+	for _,poly := range secondary {
+		err := geombuilder.ValidatePolygon(poly)
+		if err==nil {
+			third = append(third,poly)
+		}
+	}
+	
+	return third,nil
 }
 
 
 func (b *Builder) RelationAdd(n *osm.Relation) error {
-	if !n.Visible { return nil }
+	if !n.Visible { return b.AfterWrite() }
 	hs := tags2hstore(n.Tags)
 	
 	var roads bool
@@ -853,7 +962,7 @@ func (b *Builder) RelationAdd(n *osm.Relation) error {
 	
 	eofu:
 	
-	return nil
+	return b.AfterWrite()
 }
 
 
